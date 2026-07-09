@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +30,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	componentbaseconfig "k8s.io/component-base/config"
 
@@ -39,6 +40,22 @@ import (
 	"sigs.k8s.io/descheduler/pkg/descheduler/client"
 	"sigs.k8s.io/descheduler/pkg/framework/plugins/defaultevictor"
 	"sigs.k8s.io/descheduler/pkg/framework/plugins/podlifetime"
+)
+
+const (
+	leaderElectionMaxPodLifeTimeSeconds uint = 5
+	leaderElectionPodLifeTimeBuffer          = 2 * time.Second
+	leaderElectionPodChangePollInterval      = 2 * time.Second
+	leaderElectionPodChangeTimeout           = 30 * time.Second
+)
+
+type leaderElectionPodChangeStatus string
+
+const (
+	leaderElectionNoNamespaceEvicted    leaderElectionPodChangeStatus = "no namespace evicted"
+	leaderElectionNamespaceAEvicted     leaderElectionPodChangeStatus = "namespace a evicted"
+	leaderElectionNamespaceBEvicted     leaderElectionPodChangeStatus = "namespace b evicted"
+	leaderElectionBothNamespacesEvicted leaderElectionPodChangeStatus = "both namespaces evicted"
 )
 
 func podlifetimePolicy(podLifeTimeArgs *podlifetime.PodLifeTimeArgs, evictorArgs *defaultevictor.DefaultEvictorArgs) *apiv1alpha2.DeschedulerPolicy {
@@ -125,6 +142,9 @@ func TestLeaderElection(t *testing.T) {
 	waitForPodsRunning(ctx, t, clientSet, deployment2.Labels, 5, deployment2.Namespace)
 	podListBOrg := getCurrentPodNames(ctx, clientSet, ns2, t)
 
+	// Ensure the first descheduler run sees pods old enough for PodLifeTime.
+	time.Sleep(time.Duration(leaderElectionMaxPodLifeTimeSeconds)*time.Second + leaderElectionPodLifeTimeBuffer)
+
 	// Delete the descheduler lease
 	err = clientSet.CoordinationV1().Leases("kube-system").Delete(ctx, "descheduler", metav1.DeleteOptions{})
 	if err != nil {
@@ -164,30 +184,103 @@ func TestLeaderElection(t *testing.T) {
 		clientSet.CoordinationV1().Leases("kube-system").Delete(ctx, "descheduler", metav1.DeleteOptions{})
 	}()
 
-	// wait for a while so all the pods are 5 seconds older
-	time.Sleep(7 * time.Second)
-
-	// validate only pods from e2e-testleaderelection-a namespace are evicted.
-	podListA := getCurrentPodNames(ctx, clientSet, ns1, t)
-	podListB := getCurrentPodNames(ctx, clientSet, ns2, t)
-
-	left := reflect.DeepEqual(podListAOrg, podListA)
-	right := reflect.DeepEqual(podListBOrg, podListB)
-
-	singleNamespaceEvicted := (left && !right) || (!left && right)
-
-	if singleNamespaceEvicted {
-		if !left {
-			t.Logf("Only the pods in %s namespace are evicted. Pods before: %s, Pods after %s", ns1, podListAOrg, podListA)
-		} else {
-			t.Logf("Only the pods in %s namespace are evicted. Pods before: %s, Pods after %s", ns2, podListBOrg, podListB)
+	// Validate pods from exactly one namespace are evicted.
+	var podListA, podListB []string
+	var podChangeStatus leaderElectionPodChangeStatus
+	if err := wait.PollUntilContextTimeout(ctx, leaderElectionPodChangePollInterval, leaderElectionPodChangeTimeout, true, func(ctx context.Context) (bool, error) {
+		podListA = getCurrentPodNames(ctx, clientSet, ns1, t)
+		podListB = getCurrentPodNames(ctx, clientSet, ns2, t)
+		if podListA == nil || podListB == nil {
+			return false, nil
 		}
-	} else {
-		if left && right {
-			t.Fatalf("No pods evicted. Probably none of the deschedulers were running.")
-		} else {
-			t.Fatalf("Pods are evicted in both namespaces.\n\tFor %s namespace\n\tPods before: %s,\n\tPods after %s.\n\tAnd, for %s namespace\n\tPods before: %s,\n\tPods after: %s", ns1, podListAOrg, podListA, ns2, podListBOrg, podListB)
+
+		podChangeStatus = getLeaderElectionPodChangeStatus(podListAOrg, podListA, podListBOrg, podListB)
+		t.Logf("Pod change status: %s. For %s namespace, Pods before: %s, Pods after: %s. For %s namespace, Pods before: %s, Pods after: %s", podChangeStatus, ns1, podListAOrg, podListA, ns2, podListBOrg, podListB)
+
+		if podChangeStatus == leaderElectionNoNamespaceEvicted {
+			return false, nil
 		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("No pods evicted. Probably none of the deschedulers were running. For %s namespace, Pods before: %s, Pods after: %s. For %s namespace, Pods before: %s, Pods after: %s", ns1, podListAOrg, podListA, ns2, podListBOrg, podListB)
+	}
+
+	switch podChangeStatus {
+	case leaderElectionNamespaceAEvicted:
+		t.Logf("Only the pods in %s namespace are evicted. Pods before: %s, Pods after %s", ns1, podListAOrg, podListA)
+	case leaderElectionNamespaceBEvicted:
+		t.Logf("Only the pods in %s namespace are evicted. Pods before: %s, Pods after %s", ns2, podListBOrg, podListB)
+	case leaderElectionBothNamespacesEvicted:
+		t.Fatalf("Pods are evicted in both namespaces.\n\tFor %s namespace\n\tPods before: %s,\n\tPods after %s.\n\tAnd, for %s namespace\n\tPods before: %s,\n\tPods after: %s", ns1, podListAOrg, podListA, ns2, podListBOrg, podListB)
+	default:
+		t.Fatalf("Unexpected pod change status %q", podChangeStatus)
+	}
+}
+
+func getLeaderElectionPodChangeStatus(originalA, currentA, originalB, currentB []string) leaderElectionPodChangeStatus {
+	namespaceAChanged := !sets.NewString(originalA...).Equal(sets.NewString(currentA...))
+	namespaceBChanged := !sets.NewString(originalB...).Equal(sets.NewString(currentB...))
+
+	switch {
+	case namespaceAChanged && namespaceBChanged:
+		return leaderElectionBothNamespacesEvicted
+	case namespaceAChanged:
+		return leaderElectionNamespaceAEvicted
+	case namespaceBChanged:
+		return leaderElectionNamespaceBEvicted
+	default:
+		return leaderElectionNoNamespaceEvicted
+	}
+}
+
+func TestLeaderElectionPodChangeStatus(t *testing.T) {
+	originalA := []string{"a-1", "a-2"}
+	originalB := []string{"b-1", "b-2"}
+
+	tests := []struct {
+		name     string
+		currentA []string
+		currentB []string
+		expected leaderElectionPodChangeStatus
+	}{
+		{
+			name:     "no namespace evicted",
+			currentA: originalA,
+			currentB: originalB,
+			expected: leaderElectionNoNamespaceEvicted,
+		},
+		{
+			name:     "pod list reordering is not an eviction",
+			currentA: []string{"a-2", "a-1"},
+			currentB: []string{"b-2", "b-1"},
+			expected: leaderElectionNoNamespaceEvicted,
+		},
+		{
+			name:     "namespace a evicted",
+			currentA: []string{"a-3", "a-4"},
+			currentB: originalB,
+			expected: leaderElectionNamespaceAEvicted,
+		},
+		{
+			name:     "namespace b evicted",
+			currentA: originalA,
+			currentB: []string{"b-3", "b-4"},
+			expected: leaderElectionNamespaceBEvicted,
+		},
+		{
+			name:     "both namespaces evicted",
+			currentA: []string{"a-3", "a-4"},
+			currentB: []string{"b-3", "b-4"},
+			expected: leaderElectionBothNamespacesEvicted,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := getLeaderElectionPodChangeStatus(originalA, tc.currentA, originalB, tc.currentB); got != tc.expected {
+				t.Fatalf("expected %v, got %v", tc.expected, got)
+			}
+		})
 	}
 }
 
@@ -207,7 +300,7 @@ func createDeployment(t *testing.T, ctx context.Context, clientSet clientset.Int
 }
 
 func startDeschedulerServer(t *testing.T, ctx context.Context, clientSet clientset.Interface, testName string) (string, *appsv1.Deployment, *v1.ConfigMap) {
-	var maxLifeTime uint = 5
+	maxLifeTime := leaderElectionMaxPodLifeTimeSeconds
 	podLifeTimeArgs := &podlifetime.PodLifeTimeArgs{
 		MaxPodLifeTimeSeconds: &maxLifeTime,
 		Namespaces: &api.Namespaces{
