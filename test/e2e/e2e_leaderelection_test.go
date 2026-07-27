@@ -207,11 +207,11 @@ func TestLeaderElection(t *testing.T) {
 
 	switch podChangeStatus {
 	case namespaceAEvicted:
-		t.Logf("Only the pods in %s namespace are evicted. Pods before: %v, Pods after %v", ns1, podListAOrg, podListA)
+		t.Logf("Only the pods in %s namespace are evicted. Pods before: %v, Pods after: %v", ns1, podListAOrg, podListA)
 	case namespaceBEvicted:
-		t.Logf("Only the pods in %s namespace are evicted. Pods before: %v, Pods after %v", ns2, podListBOrg, podListB)
+		t.Logf("Only the pods in %s namespace are evicted. Pods before: %v, Pods after: %v", ns2, podListBOrg, podListB)
 	case bothNamespacesEvicted:
-		t.Fatalf("Pods are evicted in both namespaces.\n\tFor %s namespace\n\tPods before: %v,\n\tPods after %v.\n\tAnd, for %s namespace\n\tPods before: %v,\n\tPods after: %v", ns1, podListAOrg, podListA, ns2, podListBOrg, podListB)
+		t.Fatalf("Pods are evicted in both namespaces.\n\tFor %s namespace\n\tPods before: %v,\n\tPods after: %v.\n\tAnd, for %s namespace\n\tPods before: %v,\n\tPods after: %v", ns1, podListAOrg, podListA, ns2, podListBOrg, podListB)
 	default:
 		t.Fatalf("Unexpected pod change status %q", podChangeStatus)
 	}
