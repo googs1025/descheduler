@@ -19,6 +19,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -309,7 +310,11 @@ func minCPUUsageMilliForThreshold(node *v1.Node, threshold api.Percentage) int64
 	if allocatableCPU == nil || allocatableCPU.MilliValue() <= 0 {
 		return 1
 	}
-	return int64(float64(threshold) * 0.01 * float64(allocatableCPU.MilliValue()))
+	minCPUUsage := math.Ceil(float64(threshold) * 0.01 * float64(allocatableCPU.MilliValue()))
+	if minCPUUsage <= 0 && threshold > 0 {
+		return 1
+	}
+	return int64(minCPUUsage)
 }
 
 func waitForLowNodeUtilizationMetrics(ctx context.Context, t testing.TB, metricsClient metricsclient.Interface, nodeName, namespace string, minMilliCPUUsage int64, timeout, interval time.Duration) error {
@@ -350,8 +355,11 @@ func waitForLowNodeUtilizationMetrics(ctx context.Context, t testing.TB, metrics
 		}
 
 		lastPodCPUUsage = totalCPU.MilliValue()
-		t.Logf("Waiting for pod metrics total cpu to get to %vm, currently %vm", minMilliCPUUsage, lastPodCPUUsage)
-		return lastPodCPUUsage >= minMilliCPUUsage, nil
+		if lastPodCPUUsage < minMilliCPUUsage {
+			t.Logf("Waiting for pod metrics total cpu to get to %vm, currently %vm", minMilliCPUUsage, lastPodCPUUsage)
+			return false, nil
+		}
+		return true, nil
 	})
 	if err == nil {
 		return nil
